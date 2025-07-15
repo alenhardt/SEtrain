@@ -1,240 +1,405 @@
 #!/usr/bin/env python3
 """
-Simple example showing how to use the lattice filterbank for IRM approximation.
+IRM Lattice Filterbank Example - Real Audio Files
 
-This script demonstrates how to:
-1. Load your own IRM data (T, F) format
-2. Approximate it with a lattice filterbank  
-3. Process audio with time-varying parameters
+This script:
+1. Takes two WAV files: noisy mixture and clean (denoised) version
+2. Computes the complex IRM: mask = STFT(clean) / STFT(mixture)  
+3. Approximates the magnitude mask with a lattice filterbank
+4. Processes the noisy file and saves the result
+
+Usage:
+    python irm_example.py noisy_mixture.wav clean_denoised.wav [options]
+
+Options:
+    --output OUTPUT_FILE    Output filename (default: filtered_output.wav)
+    --num-filters N         Number of filters in bank (default: 8)
+    --nfft N               FFT size (default: 512)
+    --hop-length N         STFT hop length (default: 256)
+    --max-gain-db DB       Maximum gain in dB (default: 20.0)
+    --filter-type TYPE     Filter type: peaking, bandpass, mixed (default: peaking)
+    --freq-range F1,F2     Frequency range in Hz (default: 80,16000)
+    --magnitude-only       Use magnitude-only mask (default: True)
+    --include-phase        Try to include phase information (experimental)
 """
 
+import argparse
 import numpy as np
+import librosa
+import soundfile as sf
+import matplotlib.pyplot as plt
+from scipy import signal
 from lattice_filterbank import approximate_irm_with_lattice_filterbank, TimeVaryingLatticeFilterbank
 
-def example_with_your_irm():
+
+def load_audio_files(noisy_file, clean_file):
+    """Load and align two audio files."""
+    print(f"📁 Loading audio files...")
+    
+    # Load audio files
+    noisy_audio, sr_noisy = librosa.load(noisy_file, sr=None)
+    clean_audio, sr_clean = librosa.load(clean_file, sr=None)
+    
+    print(f"   Noisy: {noisy_file} - {len(noisy_audio)} samples, {sr_noisy} Hz")
+    print(f"   Clean: {clean_file} - {len(clean_audio)} samples, {sr_clean} Hz")
+    
+    # Check sample rates match
+    if sr_noisy != sr_clean:
+        print(f"⚠️  Sample rate mismatch! Resampling clean to {sr_noisy} Hz")
+        clean_audio = librosa.resample(clean_audio, orig_sr=sr_clean, target_sr=sr_noisy)
+    
+    # Align lengths (trim to shorter)
+    min_length = min(len(noisy_audio), len(clean_audio))
+    noisy_audio = noisy_audio[:min_length]
+    clean_audio = clean_audio[:min_length]
+    
+    print(f"✅ Aligned to {min_length} samples at {sr_noisy} Hz ({min_length/sr_noisy:.2f} seconds)")
+    
+    return noisy_audio, clean_audio, sr_noisy
+
+
+def compute_irm_mask(noisy_audio, clean_audio, nfft=512, hop_length=256, magnitude_only=True):
     """
-    Example function showing how to use your own IRM data.
-    Replace 'your_irm_data' with your actual IRM array.
+    Compute the Ideal Ratio Mask from noisy and clean audio.
+    
+    mask = STFT(clean) / STFT(noisy)
     """
+    print(f"🔬 Computing IRM mask...")
+    print(f"   STFT parameters: nfft={nfft}, hop_length={hop_length}")
     
-    print("🎯 IRM Lattice Filterbank Example")
-    print("=" * 40)
+    # Compute STFTs
+    stft_noisy = librosa.stft(noisy_audio, n_fft=nfft, hop_length=hop_length)
+    stft_clean = librosa.stft(clean_audio, n_fft=nfft, hop_length=hop_length)
     
-    # ============================================
-    # STEP 1: Prepare your IRM data
-    # ============================================
+    print(f"   STFT shape: {stft_noisy.shape} (freq x time)")
     
-    # Your IRM should have shape (T, F) where:
-    # T = number of time frames (STFT hops)  
-    # F = number of frequency bins (NFFT//2 + 1)
+    # Compute complex mask: mask = clean / noisy
+    # Add small epsilon to avoid division by zero
+    epsilon = 1e-8
+    complex_mask = stft_clean / (stft_noisy + epsilon)
     
-    # Example: Load your actual IRM data
-    # H_mag = np.load('your_irm_file.npy')  # Shape: (T, 129) for 256-point FFT
+    if magnitude_only:
+        # Use magnitude-only mask
+        magnitude_mask = np.abs(complex_mask)
+        
+        # Transpose to (time, freq) format for filterbank
+        H_mag = magnitude_mask.T  # Shape: (time_frames, freq_bins)
+        
+        print(f"✅ Magnitude mask computed: shape {H_mag.shape}")
+        print(f"   Mask range: {H_mag.min():.3f} to {H_mag.max():.3f}")
+        
+        return H_mag, None
     
-    # For this example, create synthetic IRM data
-    T, F = 30, 129  # 30 time frames, 129 frequency bins
-    H_mag = create_example_irm(T, F)
+    else:
+        # Experimental: try to handle phase information
+        magnitude_mask = np.abs(complex_mask)
+        phase_mask = np.angle(complex_mask)
+        
+        H_mag = magnitude_mask.T
+        H_phase = phase_mask.T
+        
+        print(f"✅ Complex mask computed: shape {H_mag.shape}")
+        print(f"   Magnitude range: {H_mag.min():.3f} to {H_mag.max():.3f}")
+        print(f"   Phase range: {H_phase.min():.3f} to {H_phase.max():.3f} rad")
+        
+        return H_mag, H_phase
+
+
+def apply_minimum_phase_conversion(H_mag):
+    """
+    Convert magnitude response to minimum phase using cepstrum method.
+    This is experimental for handling phase information.
+    """
+    print("🔄 Applying minimum phase conversion...")
     
-    print(f"IRM shape: {H_mag.shape}")
-    print(f"IRM range: {H_mag.min():.3f} to {H_mag.max():.3f}")
+    # Work in log domain
+    log_H = np.log(H_mag + 1e-8)
     
-    # ============================================  
-    # STEP 2: Configure lattice filterbank
-    # ============================================
+    # Apply cepstrum method for each time frame
+    H_complex = np.zeros(H_mag.shape, dtype=complex)
     
-    # Basic configuration - adjust these for your application
+    for t in range(H_mag.shape[0]):
+        # Real cepstrum
+        log_spectrum = log_H[t, :]
+        
+        # Symmetrize for real cepstrum (assume conjugate symmetry)
+        log_spectrum_full = np.concatenate([log_spectrum, log_spectrum[-2:0:-1]])
+        
+        # Cepstrum
+        cepstrum = np.fft.ifft(log_spectrum_full).real
+        
+        # Minimum phase cepstrum (causal)
+        cepstrum_min_phase = cepstrum.copy()
+        cepstrum_min_phase[1:len(cepstrum)//2] *= 2
+        cepstrum_min_phase[len(cepstrum)//2+1:] = 0
+        
+        # Back to frequency domain
+        log_H_min_phase = np.fft.fft(cepstrum_min_phase)
+        H_min_phase = np.exp(log_H_min_phase)
+        
+        # Take first half (positive frequencies)
+        H_complex[t, :] = H_min_phase[:len(log_spectrum)]
+    
+    print(f"✅ Minimum phase conversion complete")
+    
+    return np.abs(H_complex), np.angle(H_complex)
+
+
+def create_filterbank_approximation(H_mag, fs, nfft, num_filters=8, max_gain_db=20.0, 
+                                   filter_type='peaking', freq_range=(80, 16000)):
+    """Create lattice filterbank approximation of the IRM."""
+    print(f"🎛️ Creating lattice filterbank approximation...")
+    print(f"   Filters: {num_filters}, Type: {filter_type}")
+    print(f"   Frequency range: {freq_range[0]}-{freq_range[1]} Hz")
+    print(f"   Max gain: ±{max_gain_db} dB")
+    
+    # Create lattice filterbank configuration
     irm_config = approximate_irm_with_lattice_filterbank(
         H_mag,
-        fs=48000,              # Your audio sample rate
-        nfft=256,              # FFT size used to compute H_mag  
-        num_filters=8,         # Number of filters (6-16 typical)
-        filter_type='peaking', # 'peaking', 'bandpass', or 'mixed'
-        freq_range=(100, 16000), # Frequency range to cover
-        max_gain_db=20.0       # Maximum gain/attenuation
+        fs=fs,
+        nfft=nfft,
+        num_filters=num_filters,
+        filter_type=filter_type,
+        freq_range=freq_range,
+        max_gain_db=max_gain_db
     )
     
-    print(f"✅ Lattice filterbank configured")
-    print(f"Average approximation error: {np.mean(irm_config['approximation_error']):.4f}")
-    
-    # ============================================
-    # STEP 3: Create time-varying filterbank
-    # ============================================
-    
+    # Create time-varying filterbank
     filterbank = TimeVaryingLatticeFilterbank(irm_config)
     
-    # ============================================
-    # STEP 4: Process audio with your IRM
-    # ============================================
+    avg_error = np.mean(irm_config['approximation_error'])
+    max_error = np.max(irm_config['approximation_error'])
     
-    # Create example audio signal (replace with your actual audio)
-    duration = 1.5  # seconds
-    fs = 48000
-    t = np.linspace(0, duration, int(fs * duration))
+    print(f"✅ Filterbank created")
+    print(f"   Average approximation error: {avg_error:.4f}")
+    print(f"   Maximum approximation error: {max_error:.4f}")
     
-    # Example signal: chirp + noise
-    f_start, f_end = 300, 3000
-    test_signal = 0.7 * np.sin(2 * np.pi * (f_start * t + (f_end - f_start) * t**2 / (2 * duration)))
-    test_signal += 0.2 * np.random.randn(len(t))
+    return filterbank, irm_config
+
+
+def process_audio_with_filterbank(noisy_audio, filterbank, hop_length, fs):
+    """Process noisy audio with time-varying lattice filterbank."""
+    print(f"🎵 Processing audio with filterbank...")
     
-    print(f"Processing {len(test_signal)} audio samples...")
-    
-    # Map audio samples to IRM frames
-    # This depends on your STFT hop length
-    hop_length_samples = 512  # Match your STFT analysis
-    frame_indices = np.arange(len(test_signal)) // hop_length_samples
+    # Map audio samples to IRM time frames
+    frame_indices = np.arange(len(noisy_audio)) // hop_length
     frame_indices = np.clip(frame_indices, 0, filterbank.num_frames - 1)
     
-    # Process with time-varying IRM approximation
-    processed_signal = filterbank.process_buffer(test_signal, frame_indices)
+    print(f"   Processing {len(noisy_audio)} samples ({len(noisy_audio)/fs:.2f}s)")
+    print(f"   Using {filterbank.num_frames} IRM frames with {hop_length} sample hops")
+    
+    # Process with time-varying parameters
+    processed_audio = filterbank.process_buffer(noisy_audio, frame_indices)
     
     print(f"✅ Audio processing complete")
     
-    # ============================================
-    # STEP 5: Save results
-    # ============================================
-    
-    from scipy.io import wavfile
-    
-    # Convert to 16-bit integer for WAV files
-    test_int16 = (test_signal * 32767).astype(np.int16)
-    processed_int16 = (processed_signal * 32767).astype(np.int16)
-    
-    # Save audio files
-    wavfile.write('example_original.wav', fs, test_int16)
-    wavfile.write('example_processed_with_irm.wav', fs, processed_int16)
-    
-    print(f"📁 Saved: example_original.wav")
-    print(f"📁 Saved: example_processed_with_irm.wav")
-    
-    return irm_config, filterbank
+    return processed_audio
 
 
-def create_example_irm(T: int, F: int) -> np.ndarray:
-    """
-    Create example IRM data for demonstration.
-    Replace this with your actual IRM loading code.
-    """
+def create_visualization(noisy_audio, clean_audio, processed_audio, H_mag, irm_config, 
+                        fs, nfft, hop_length, output_prefix):
+    """Create comprehensive visualization of the IRM approximation process."""
+    print(f"📊 Creating visualization...")
     
-    # Create frequency grid (matches 256-point FFT)
-    frequencies = np.fft.fftfreq(256, 1/48000)[:F]
+    fig, axes = plt.subplots(3, 2, figsize=(15, 12))
     
-    # Create time-varying spectral mask
-    H_mag = np.zeros((T, F))
+    # Time domain signals
+    time_axis = np.arange(len(noisy_audio)) / fs
     
-    for t in range(T):
-        time_factor = t / T
-        
-        # Example: Time-varying bandpass mask
-        center_freq = 800 + 2000 * np.sin(2 * np.pi * time_factor * 1.5)
-        bandwidth = 600 + 400 * np.cos(2 * np.pi * time_factor * 2.0)
-        
-        for f_idx, freq in enumerate(frequencies):
-            if freq <= 0:
-                H_mag[t, f_idx] = 0.5
+    axes[0, 0].plot(time_axis, noisy_audio, alpha=0.7, label='Noisy')
+    axes[0, 0].plot(time_axis, clean_audio, alpha=0.7, label='Clean')
+    axes[0, 0].set_title('Input Signals')
+    axes[0, 0].set_xlabel('Time (s)')
+    axes[0, 0].set_ylabel('Amplitude')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    axes[0, 1].plot(time_axis, noisy_audio, alpha=0.7, label='Noisy')
+    axes[0, 1].plot(time_axis, processed_audio, alpha=0.7, label='Filtered')
+    axes[0, 1].set_title('Output Comparison')
+    axes[0, 1].set_xlabel('Time (s)')
+    axes[0, 1].set_ylabel('Amplitude')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # IRM magnitude spectrogram
+    frequencies = np.fft.fftfreq(nfft, 1/fs)[:nfft//2 + 1]
+    time_frames = np.arange(H_mag.shape[0]) * hop_length / fs
+    
+    im1 = axes[1, 0].imshow(H_mag.T, aspect='auto', origin='lower', 
+                           extent=[time_frames[0], time_frames[-1], 
+                                  frequencies[0], frequencies[-1]])
+    axes[1, 0].set_title('Target IRM Magnitude')
+    axes[1, 0].set_xlabel('Time (s)')
+    axes[1, 0].set_ylabel('Frequency (Hz)')
+    axes[1, 0].set_ylim(0, fs//4)  # Show up to Nyquist/2
+    plt.colorbar(im1, ax=axes[1, 0], label='Magnitude')
+    
+    # Reconstruct filterbank approximation from filter parameters
+    # Create frequency grid
+    freq_bins = np.fft.fftfreq(nfft, 1/fs)[:nfft//2 + 1]
+    H_approx = np.ones((H_mag.shape[0], len(freq_bins)))
+    
+    # For each time frame, compute combined filter response
+    for t in range(H_mag.shape[0]):
+        if t < len(irm_config['filter_params']):
+            frame_params = irm_config['filter_params'][t]
+            for param in frame_params:
+                # Simple approximation: Gaussian-like response around center frequency
+                center_f = param.center_freq
+                gain_linear = 10**(param.gain / 20)
+                bandwidth = center_f / param.q_factor
+                
+                # Apply filter response to frequency grid
+                for f_idx, freq in enumerate(freq_bins):
+                    if freq > 0:
+                        # Gaussian-like filter response
+                        response = gain_linear * np.exp(-((freq - center_f) / bandwidth)**2)
+                        H_approx[t, f_idx] *= response
+    
+    im2 = axes[1, 1].imshow(H_approx.T, aspect='auto', origin='lower',
+                           extent=[time_frames[0], time_frames[-1], 
+                                  frequencies[0], frequencies[-1]])
+    axes[1, 1].set_title('Filterbank Approximation')
+    axes[1, 1].set_xlabel('Time (s)')
+    axes[1, 1].set_ylabel('Frequency (Hz)')
+    axes[1, 1].set_ylim(0, fs//4)
+    plt.colorbar(im2, ax=axes[1, 1], label='Magnitude')
+    
+    # Approximation error
+    error = np.abs(H_mag - H_approx)
+    im3 = axes[2, 0].imshow(error.T, aspect='auto', origin='lower',
+                           extent=[time_frames[0], time_frames[-1], 
+                                  frequencies[0], frequencies[-1]])
+    axes[2, 0].set_title('Approximation Error')
+    axes[2, 0].set_xlabel('Time (s)')
+    axes[2, 0].set_ylabel('Frequency (Hz)')
+    axes[2, 0].set_ylim(0, fs//4)
+    plt.colorbar(im3, ax=axes[2, 0], label='|Error|')
+    
+    # Filter parameter evolution
+    filter_params = irm_config['filter_params']
+    
+    # Plot gain values for first few filters
+    for filt_idx in range(min(3, irm_config['config']['num_filters'])):  # Show first 3 filters
+        gain_values = []
+        for t in range(len(filter_params)):
+            if filt_idx < len(filter_params[t]):
+                gain_values.append(filter_params[t][filt_idx].gain)
             else:
-                # Distance from center frequency
-                freq_distance = abs(freq - center_freq)
-                
-                # Bandpass-like response
-                if freq_distance < bandwidth / 2:
-                    gain = 1.0 - 0.3 * (freq_distance / (bandwidth / 2))
-                else:
-                    gain = 0.2 * np.exp(-(freq_distance - bandwidth/2) / 800)
-                
-                H_mag[t, f_idx] = np.clip(gain, 0.1, 1.5)
+                gain_values.append(0.0)
+        
+        axes[2, 1].plot(time_frames[:len(gain_values)], gain_values, 
+                       label=f'Filter {filt_idx+1} Gain (dB)', alpha=0.7)
     
-    return H_mag
+    axes[2, 1].set_title('Filter Parameters Over Time')
+    axes[2, 1].set_xlabel('Time (s)')
+    axes[2, 1].set_ylabel('Parameter Value')
+    axes[2, 1].legend()
+    axes[2, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save visualization
+    plot_filename = f"{output_prefix}_analysis.png"
+    plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"📁 Saved: {plot_filename}")
 
 
-def real_time_processing_example():
-    """
-    Example of real-time processing with chunk-based updates.
-    """
+def main():
+    parser = argparse.ArgumentParser(description='IRM Lattice Filterbank Approximation')
+    parser.add_argument('noisy_file', help='Noisy mixture WAV file')
+    parser.add_argument('clean_file', help='Clean (denoised) WAV file')
+    parser.add_argument('--output', default='filtered_output.wav', 
+                       help='Output filename (default: filtered_output.wav)')
+    parser.add_argument('--num-filters', type=int, default=8,
+                       help='Number of filters in bank (default: 8)')
+    parser.add_argument('--nfft', type=int, default=512,
+                       help='FFT size (default: 512)')
+    parser.add_argument('--hop-length', type=int, default=256,
+                       help='STFT hop length (default: 256)')
+    parser.add_argument('--max-gain-db', type=float, default=20.0,
+                       help='Maximum gain in dB (default: 20.0)')
+    parser.add_argument('--filter-type', choices=['peaking', 'bandpass', 'mixed'], 
+                       default='peaking', help='Filter type (default: peaking)')
+    parser.add_argument('--freq-range', type=str, default='80,16000',
+                       help='Frequency range in Hz as F1,F2 (default: 80,16000)')
+    parser.add_argument('--magnitude-only', action='store_true', default=True,
+                       help='Use magnitude-only mask (default: True)')
+    parser.add_argument('--include-phase', action='store_true',
+                       help='Try to include phase information (experimental)')
     
-    print("\n🎛️ Real-Time Processing Example")
-    print("=" * 40)
+    args = parser.parse_args()
     
-    # Create IRM configuration
-    T, F = 50, 129
-    H_mag = create_example_irm(T, F)
+    # Parse frequency range
+    freq_range = tuple(map(int, args.freq_range.split(',')))
     
-    irm_config = approximate_irm_with_lattice_filterbank(
-        H_mag, fs=48000, num_filters=6, max_gain_db=15.0
-    )
+    print("🎯 IRM LATTICE FILTERBANK - REAL AUDIO FILES")
+    print("=" * 60)
     
-    # Real-time processor class
-    class RealTimeIRMProcessor:
-        def __init__(self, irm_config, hop_length_samples):
-            self.filterbank = TimeVaryingLatticeFilterbank(irm_config)
-            self.hop_length = hop_length_samples
-            self.sample_count = 0
-            
-        def process_chunk(self, audio_chunk):
-            # Determine current IRM frame
-            current_frame = self.sample_count // self.hop_length
-            current_frame = min(current_frame, self.filterbank.num_frames - 1)
-            
-            # Update filterbank parameters
-            self.filterbank.update_to_frame(current_frame)
-            
-            # Process samples
-            processed_chunk = np.zeros_like(audio_chunk)
-            for i, sample in enumerate(audio_chunk):
-                processed_chunk[i] = self.filterbank.process_sample(sample)
-            
-            self.sample_count += len(audio_chunk)
-            return processed_chunk
-    
-    # Initialize processor
-    processor = RealTimeIRMProcessor(irm_config, hop_length_samples=512)
-    
-    # Simulate real-time processing with chunks
-    chunk_size = 1024  # Process 1024 samples at a time
-    total_samples = 48000  # 1 second of audio
-    
-    all_processed = []
-    
-    print(f"Processing {total_samples} samples in chunks of {chunk_size}...")
-    
-    for i in range(0, total_samples, chunk_size):
-        # Create audio chunk (in real app, this would come from audio input)
-        t_chunk = np.linspace(i/48000, (i+chunk_size)/48000, chunk_size)
-        audio_chunk = 0.5 * np.sin(2 * np.pi * 1000 * t_chunk)  # 1kHz tone
+    try:
+        # Load audio files
+        noisy_audio, clean_audio, fs = load_audio_files(args.noisy_file, args.clean_file)
         
-        # Process chunk
-        processed_chunk = processor.process_chunk(audio_chunk)
-        all_processed.append(processed_chunk)
+        # Compute IRM mask
+        magnitude_only = args.magnitude_only and not args.include_phase
+        H_mag, H_phase = compute_irm_mask(noisy_audio, clean_audio, 
+                                         args.nfft, args.hop_length, magnitude_only)
         
-        if i % (chunk_size * 10) == 0:  # Progress update
-            progress = 100 * i / total_samples
-            frame = processor.sample_count // 512
-            print(f"  Progress: {progress:.1f}% (IRM frame {frame})")
+        # Optional: minimum phase conversion
+        if args.include_phase and H_phase is None:
+            print("🔄 Phase information requested - applying minimum phase conversion")
+            H_mag, H_phase = apply_minimum_phase_conversion(H_mag)
+        
+        # Create filterbank approximation
+        filterbank, irm_config = create_filterbank_approximation(
+            H_mag, fs, args.nfft, args.num_filters, args.max_gain_db,
+            args.filter_type, freq_range
+        )
+        
+        # Process audio
+        processed_audio = process_audio_with_filterbank(
+            noisy_audio, filterbank, args.hop_length, fs
+        )
+        
+        # Save output
+        output_prefix = args.output.rsplit('.', 1)[0]  # Remove extension
+        sf.write(args.output, processed_audio, fs)
+        print(f"📁 Saved: {args.output}")
+        
+        # Save original files for comparison
+        sf.write(f"{output_prefix}_original_noisy.wav", noisy_audio, fs)
+        sf.write(f"{output_prefix}_original_clean.wav", clean_audio, fs)
+        print(f"📁 Saved: {output_prefix}_original_noisy.wav")
+        print(f"📁 Saved: {output_prefix}_original_clean.wav")
+        
+        # Create visualization
+        create_visualization(noisy_audio, clean_audio, processed_audio, 
+                           H_mag, irm_config, fs, args.nfft, args.hop_length,
+                           output_prefix)
+        
+        # Print summary
+        print("\n" + "=" * 60)
+        print("✅ PROCESSING COMPLETE")
+        print("=" * 60)
+        print(f"Input files: {args.noisy_file}, {args.clean_file}")
+        print(f"Output: {args.output}")
+        print(f"Filterbank: {args.num_filters} {args.filter_type} filters")
+        print(f"IRM frames: {H_mag.shape[0]}, Frequency bins: {H_mag.shape[1]}")
+        print(f"Audio duration: {len(noisy_audio)/fs:.2f} seconds")
+        avg_error = np.mean(irm_config['approximation_error'])
+        print(f"Average approximation error: {avg_error:.4f}")
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
     
-    # Combine all chunks
-    processed_signal = np.concatenate(all_processed)
-    
-    print(f"✅ Real-time processing simulation complete")
-    print(f"Processed {len(processed_signal)} samples with {T} parameter updates")
-    
-    return processed_signal
+    return 0
 
 
 if __name__ == "__main__":
-    print("🎯 LATTICE FILTERBANK IRM APPROXIMATION EXAMPLES")
-    print("=" * 60)
-    
-    # Run basic example
-    irm_config, filterbank = example_with_your_irm()
-    
-    # Run real-time processing example  
-    real_time_processed = real_time_processing_example()
-    
-    print("\n" + "=" * 60)
-    print("✅ EXAMPLES COMPLETE")
-    print("=" * 60)
-    print("\nTo use with your own data:")
-    print("1. Replace create_example_irm() with your IRM loading code")
-    print("2. Ensure your IRM has shape (T, F) with F = NFFT//2 + 1")
-    print("3. Adjust fs, nfft, and hop_length to match your STFT parameters")
-    print("4. Tune num_filters and max_gain_db for your application")
-    print("\nSee IRM_USAGE_GUIDE.md for detailed documentation!")
+    exit(main())
