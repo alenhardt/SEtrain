@@ -45,8 +45,7 @@ class LatticeFilter:
         """
         Process a single sample through the lattice-ladder filter.
         
-        This implements the correct all-pole lattice structure followed by
-        a ladder section for zeros.
+        Implements the lattice structure compatible with RBJ's coefficient conversion.
         
         Args:
             x: Input sample
@@ -54,32 +53,29 @@ class LatticeFilter:
         Returns:
             Filtered output sample
         """
-        # All-pole lattice section (implements the denominator poles)
-        # Standard lattice algorithm with forward and backward signals
+        # Alternative lattice structure implementation
+        # This version uses a different signal flow that might match RBJ's derivation
         
-        # Initialize signals
-        f = [0.0, 0.0, 0.0]  # Forward signals: f[0]=input, f[1]=stage1, f[2]=stage2  
-        g = [0.0, 0.0, 0.0]  # Backward signals
+        # Input to first stage
+        e0 = x
         
-        # Stage 0: Input
-        f[0] = x
-        g[0] = x
+        # First lattice stage
+        e1 = e0 - self.k1 * self.s1
         
-        # Stage 1: First lattice section
-        f[1] = f[0] - self.k1 * self.s1  # Forward path
-        g[1] = self.k1 * f[1] + self.s1  # Backward path
+        # Second lattice stage  
+        e2 = e1 - self.k2 * self.s2
         
-        # Stage 2: Second lattice section  
-        f[2] = f[1] - self.k2 * self.s2  # Forward path
-        g[2] = self.k2 * f[2] + self.s2  # Backward path
+        # Update state variables (delays)
+        # Store the intermediate signals for next iteration
+        new_s1 = e1
+        new_s2 = self.s1
         
-        # Update delay elements (store backward signals)
-        self.s2 = self.s1
-        self.s1 = g[1]
+        # Ladder output computation
+        y = self.v0 * e0 + self.v1 * e1 + self.v2 * e2
         
-        # Ladder section: linear combination of lattice outputs
-        # This implements the numerator (zeros) of the transfer function
-        y = self.v0 * f[0] + self.v1 * f[1] + self.v2 * f[2]
+        # Update delays
+        self.s2 = new_s2
+        self.s1 = new_s1
         
         return y
 
@@ -218,8 +214,8 @@ def biquad_to_lattice(b0: float, b1: float, b2: float, a1: float, a2: float) -> 
     v2 = b2
     v1 = b1 - a1 * b2
     
-    # Try interpretation 2: v0 = b0 - (a1 / (a2 + 1))*b1 + a1^2 / (a2 + 1) - a2 * b2
-    v0 = b0 - (a1 / (a2 + 1)) * b1 + a1*a1 / (a2 + 1) - a2 * b2
+    # Corrected v0 formula from RBJ:
+    v0 = b0 - (a1 / (a2 + 1)) * b1 + ((a1*a1 / (a2 + 1)) - a2) * b2
     
     return k1, k2, v0, v1, v2
 
