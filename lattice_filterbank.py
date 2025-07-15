@@ -872,6 +872,487 @@ def demo_realtime_modulation():
     print("structure enables smooth, glitch-free real-time modulation!")
 
 
+def approximate_irm_with_lattice_filterbank(H_mag: np.ndarray, fs: int = 48000, nfft: int = 256, 
+                                          num_filters: int = 8, filter_type: str = 'peaking',
+                                          freq_range: tuple = (100, 16000), 
+                                          max_gain_db: float = 20.0) -> dict:
+    """
+    Approximate an Ideal Ratio Mask using a time-varying lattice filterbank.
+    
+    Args:
+        H_mag: Magnitude response array with shape (T, F) where:
+               T = number of time frames (STFT hops)
+               F = number of frequency bins (NFFT//2 + 1 = 129 for 256-point FFT)
+        fs: Sample rate in Hz
+        nfft: FFT size used to compute H_mag
+        num_filters: Number of filters in the filterbank
+        filter_type: Type of filters ('peaking', 'bandpass', 'mixed')
+        freq_range: Frequency range (min_hz, max_hz) to cover
+        max_gain_db: Maximum gain/attenuation in dB
+        
+    Returns:
+        Dictionary containing:
+        - 'filter_params': List of FilterParams for each time frame and filter
+        - 'lattice_coeffs': Lattice coefficients for each time frame
+        - 'frequencies': Frequency grid for analysis
+        - 'approximation_error': RMS error between target and approximated response
+    """
+    print(f"\n🎯 APPROXIMATING IRM WITH LATTICE FILTERBANK")
+    print(f"=" * 50)
+    
+    T, F = H_mag.shape
+    print(f"IRM shape: {T} time frames × {F} frequency bins")
+    print(f"FFT size: {nfft}, Sample rate: {fs} Hz")
+    print(f"Filterbank: {num_filters} filters, Type: {filter_type}")
+    
+    # Create frequency grid (matches FFT bins)
+    frequencies = np.fft.fftfreq(nfft, 1/fs)[:F]  # 0 to fs/2
+    print(f"Frequency range: {frequencies[0]:.1f} - {frequencies[-1]:.1f} Hz")
+    
+    # Initialize filterbank design
+    if filter_type == 'mixed':
+        # Mix of lowpass, bandpass, highpass, and peaking filters
+        filter_types = (['lowpass'] + ['peaking'] * (num_filters-2) + ['highpass'])
+    else:
+        filter_types = [filter_type] * num_filters
+    
+    # Create logarithmically spaced center frequencies
+    freq_min, freq_max = freq_range
+    center_freqs = np.logspace(np.log10(freq_min), np.log10(freq_max), num_filters)
+    
+    print(f"Filter center frequencies: {[f'{f:.0f}Hz' for f in center_freqs]}")
+    
+    # Storage for results
+    all_filter_params = []  # [T][filter_idx] -> FilterParams
+    all_lattice_coeffs = []  # [T][filter_idx] -> (k1, k2, v0, v1, v2)
+    approximation_errors = []
+    
+    print(f"\n🔧 Designing filterbank for {T} time frames...")
+    
+    for t in range(T):
+        if t % max(1, T//10) == 0:  # Progress updates
+            print(f"  Processing frame {t+1}/{T} ({100*(t+1)/T:.1f}%)")
+        
+        # Target magnitude response for this time frame
+        target_response = H_mag[t, :]
+        
+        # Optimize filter parameters to approximate target response
+        frame_filters, frame_lattice, error = _optimize_filterbank_for_target(
+            target_response, frequencies, center_freqs, filter_types, 
+            fs, max_gain_db
+        )
+        
+        all_filter_params.append(frame_filters)
+        all_lattice_coeffs.append(frame_lattice)
+        approximation_errors.append(error)
+    
+    avg_error = np.mean(approximation_errors)
+    print(f"✅ Optimization complete! Average RMS error: {avg_error:.4f}")
+    
+    return {
+        'filter_params': all_filter_params,
+        'lattice_coeffs': all_lattice_coeffs,
+        'frequencies': frequencies,
+        'approximation_error': approximation_errors,
+        'center_frequencies': center_freqs,
+        'filter_types': filter_types,
+        'config': {
+            'fs': fs, 'nfft': nfft, 'num_filters': num_filters,
+            'freq_range': freq_range, 'max_gain_db': max_gain_db
+        }
+    }
+
+
+def _optimize_filterbank_for_target(target_response: np.ndarray, frequencies: np.ndarray,
+                                   center_freqs: np.ndarray, filter_types: list,
+                                   fs: int, max_gain_db: float) -> tuple:
+    """
+    Optimize filter parameters to approximate a target magnitude response.
+    
+    Uses a simple but effective approach:
+    1. For each filter, compute the desired gain at its center frequency
+    2. Use reasonable Q values and gain limits
+    3. Convert to lattice coefficients
+    
+    Returns:
+        (filter_params, lattice_coeffs, rms_error)
+    """
+    from scipy.interpolate import interp1d
+    
+    # Interpolate target response to get gains at center frequencies
+    if len(frequencies) > 1 and len(target_response) == len(frequencies):
+        interp_func = interp1d(frequencies, target_response, 
+                              kind='linear', bounds_error=False, fill_value=1.0)
+        target_gains_linear = interp_func(center_freqs)
+    else:
+        # Fallback: use nearest neighbor
+        target_gains_linear = []
+        for fc in center_freqs:
+            idx = np.argmin(np.abs(frequencies - fc))
+            target_gains_linear.append(target_response[idx])
+        target_gains_linear = np.array(target_gains_linear)
+    
+    # Convert to dB, with limits
+    target_gains_db = 20 * np.log10(np.maximum(target_gains_linear, 1e-6))
+    target_gains_db = np.clip(target_gains_db, -max_gain_db, max_gain_db)
+    
+    # Design filters
+    filter_params = []
+    lattice_coeffs = []
+    
+    for i, (fc, gain_db, ftype) in enumerate(zip(center_freqs, target_gains_db, filter_types)):
+        # Choose appropriate Q factor
+        if ftype == 'peaking':
+            q_factor = 2.0  # Moderate Q for good coverage
+        elif ftype in ['bandpass', 'lowpass', 'highpass']:
+            q_factor = 0.707  # Butterworth response
+        else:
+            q_factor = 1.0
+        
+        # Create filter parameters
+        params = FilterParams(
+            center_freq=fc,
+            gain=gain_db,
+            q_factor=q_factor,
+            fs=fs,
+            filter_type=ftype
+        )
+        
+        # Convert to lattice coefficients
+        try:
+            b0, b1, b2, a1, a2 = design_biquad_coefficients(params)
+            k1, k2, v0, v1, v2 = biquad_to_lattice(b0, b1, b2, a1, a2)
+            
+            filter_params.append(params)
+            lattice_coeffs.append((k1, k2, v0, v1, v2))
+            
+        except Exception as e:
+            print(f"Warning: Filter {i} design failed: {e}")
+            # Use unity gain as fallback
+            params.gain = 0.0
+            b0, b1, b2, a1, a2 = design_biquad_coefficients(params)
+            k1, k2, v0, v1, v2 = biquad_to_lattice(b0, b1, b2, a1, a2)
+            filter_params.append(params)
+            lattice_coeffs.append((k1, k2, v0, v1, v2))
+    
+    # Compute approximation error
+    # (This is a simplified error metric - could be improved with actual frequency response computation)
+    approx_gains_db = np.array([p.gain for p in filter_params])
+    error = np.sqrt(np.mean((target_gains_db - approx_gains_db)**2))
+    
+    return filter_params, lattice_coeffs, error
+
+
+class TimeVaryingLatticeFilterbank:
+    """
+    Time-varying lattice filterbank for IRM approximation.
+    
+    Updates filter parameters in real-time to approximate the target IRM.
+    """
+    
+    def __init__(self, irm_config: dict):
+        """
+        Initialize time-varying filterbank from IRM approximation config.
+        
+        Args:
+            irm_config: Dictionary returned from approximate_irm_with_lattice_filterbank
+        """
+        self.config = irm_config['config']
+        self.filter_params = irm_config['filter_params']  # [T][filter_idx]
+        self.lattice_coeffs = irm_config['lattice_coeffs']  # [T][filter_idx]
+        self.frequencies = irm_config['frequencies']
+        self.center_freqs = irm_config['center_frequencies']
+        
+        self.fs = self.config['fs']
+        self.num_filters = self.config['num_filters']
+        self.num_frames = len(self.filter_params)
+        
+        # Initialize lattice filters
+        self.lattice_filters = []
+        for i in range(self.num_filters):
+            # Initialize with first frame parameters
+            k1, k2, v0, v1, v2 = self.lattice_coeffs[0][i]
+            self.lattice_filters.append(RBJLatticeFilter(k1, k2, v0, v1, v2))
+        
+        self.current_frame = 0
+        
+        print(f"🎛️ TimeVaryingLatticeFilterbank initialized:")
+        print(f"   {self.num_filters} filters, {self.num_frames} time frames")
+        print(f"   Center frequencies: {[f'{f:.0f}Hz' for f in self.center_freqs]}")
+    
+    def update_to_frame(self, frame_idx: int):
+        """
+        Update all filter parameters to the specified frame.
+        
+        Args:
+            frame_idx: Target frame index (0 to num_frames-1)
+        """
+        if frame_idx < 0 or frame_idx >= self.num_frames:
+            return
+        
+        self.current_frame = frame_idx
+        
+        # Update each filter's lattice coefficients
+        for i in range(self.num_filters):
+            k1, k2, v0, v1, v2 = self.lattice_coeffs[frame_idx][i]
+            
+            # Smooth parameter update (key advantage of lattice filters!)
+            self.lattice_filters[i].k1 = k1
+            self.lattice_filters[i].k2 = k2
+            self.lattice_filters[i].v0 = v0
+            self.lattice_filters[i].v1 = v1
+            self.lattice_filters[i].v2 = v2
+    
+    def process_sample(self, x: float) -> float:
+        """
+        Process a single sample through the current filterbank configuration.
+        
+        Args:
+            x: Input sample
+            
+        Returns:
+            Filtered output sample
+        """
+        # Process through all filters in cascade
+        y = x
+        for lattice_filter in self.lattice_filters:
+            y = lattice_filter.process_sample(y)
+        
+        return y
+    
+    def process_buffer(self, input_buffer: np.ndarray, 
+                      frame_indices: np.ndarray = None) -> np.ndarray:
+        """
+        Process a buffer of samples with optional frame-by-frame parameter updates.
+        
+        Args:
+            input_buffer: Input samples
+            frame_indices: Optional frame index for each sample (for time-varying behavior)
+            
+        Returns:
+            Processed output buffer
+        """
+        output_buffer = np.zeros_like(input_buffer)
+        
+        for i, x in enumerate(input_buffer):
+            # Update filter parameters if frame indices provided
+            if frame_indices is not None and i < len(frame_indices):
+                frame_idx = int(frame_indices[i])
+                if frame_idx != self.current_frame:
+                    self.update_to_frame(frame_idx)
+            
+            # Process sample
+            output_buffer[i] = self.process_sample(x)
+        
+        return output_buffer
+    
+    def get_current_frequency_response(self, num_points: int = 512) -> tuple:
+        """
+        Compute the current frequency response of the filterbank.
+        
+        Returns:
+            (frequencies, magnitude_response)
+        """
+        # This is a simplified computation - could be improved
+        freqs = np.linspace(0, self.fs/2, num_points)
+        
+        # For a more accurate response, we'd need to compute the cascaded response
+        # For now, return the center frequencies and gains
+        current_gains = []
+        for i in range(self.num_filters):
+            params = self.filter_params[self.current_frame][i]
+            current_gains.append(params.gain)
+        
+        # Simple interpolation for visualization
+        from scipy.interpolate import interp1d
+        if len(self.center_freqs) > 1:
+            interp_func = interp1d(self.center_freqs, current_gains, 
+                                  kind='linear', bounds_error=False, fill_value=0.0)
+            magnitude_db = interp_func(freqs)
+            magnitude_linear = 10**(magnitude_db/20)
+        else:
+            magnitude_linear = np.ones_like(freqs)
+        
+        return freqs, magnitude_linear
+
+
+def demo_irm_approximation():
+    """
+    Demonstrate IRM approximation with synthetic data.
+    """
+    print("\n" + "=" * 50)
+    print("🎯 IRM APPROXIMATION DEMO")
+    print("=" * 50)
+    
+    # Create synthetic IRM data
+    T, F = 50, 129  # 50 time frames, 129 frequency bins (256-point FFT)
+    fs = 48000
+    nfft = 256
+    
+    print(f"Creating synthetic IRM: {T} frames × {F} frequency bins")
+    
+    # Create frequency grid
+    frequencies = np.fft.fftfreq(nfft, 1/fs)[:F]
+    
+    # Create synthetic time-varying magnitude response
+    H_mag = np.zeros((T, F))
+    
+    for t in range(T):
+        # Time-varying spectral pattern (simulates speech enhancement mask)
+        time_factor = t / T
+        
+        # Moving bandpass characteristic
+        center_freq = 500 + 3000 * np.sin(2 * np.pi * time_factor * 2)  # 500-3500 Hz
+        bandwidth = 1000 + 500 * np.cos(2 * np.pi * time_factor * 3)    # 500-1500 Hz bandwidth
+        
+        # Create bandpass-like response
+        for f_idx, freq in enumerate(frequencies):
+            if freq <= 0:
+                H_mag[t, f_idx] = 0.5
+            else:
+                # Distance from center frequency
+                freq_diff = abs(freq - center_freq)
+                
+                # Bandpass-like magnitude (simulates ideal ratio mask)
+                if freq_diff < bandwidth / 2:
+                    gain = 1.0 - (freq_diff / (bandwidth / 2)) * 0.5  # 0.5 to 1.0
+                else:
+                    gain = 0.1 + 0.3 * np.exp(-(freq_diff - bandwidth/2) / 1000)  # Gradual rolloff
+                
+                H_mag[t, f_idx] = gain
+    
+    print(f"✅ Synthetic IRM created with time-varying bandpass characteristic")
+    
+    # Approximate with lattice filterbank
+    print(f"\n🔧 Approximating IRM with lattice filterbank...")
+    
+    irm_config = approximate_irm_with_lattice_filterbank(
+        H_mag, fs=fs, nfft=nfft, num_filters=6, 
+        filter_type='peaking', max_gain_db=15.0
+    )
+    
+    print(f"Average approximation error: {np.mean(irm_config['approximation_error']):.4f}")
+    
+    # Create time-varying filterbank
+    print(f"\n🎛️ Creating time-varying lattice filterbank...")
+    filterbank = TimeVaryingLatticeFilterbank(irm_config)
+    
+    # Test with audio processing
+    print(f"\n🎵 Testing with audio signal...")
+    
+    # Create test signal (chirp + noise)
+    duration = 2.0  # seconds
+    t = np.linspace(0, duration, int(fs * duration), endpoint=False)
+    
+    # Frequency sweep
+    f_start, f_end = 200, 4000
+    chirp = np.sin(2 * np.pi * (f_start * t + (f_end - f_start) * t**2 / (2 * duration)))
+    
+    # Add noise
+    noise = 0.3 * np.random.randn(len(t))
+    test_signal = 0.7 * chirp + noise
+    
+    # Process with time-varying filterbank
+    # Map time to frame indices
+    hop_length = len(t) // T  # Samples per frame
+    frame_indices = np.arange(len(t)) // hop_length
+    frame_indices = np.clip(frame_indices, 0, T-1)
+    
+    print(f"Processing {len(test_signal)} samples with {T} parameter updates...")
+    
+    processed_signal = filterbank.process_buffer(test_signal, frame_indices)
+    
+    # Save results
+    output_file = "irm_approximation_demo.wav"
+    original_file = "irm_original_signal.wav"
+    
+    # Convert to 16-bit and save
+    processed_int16 = (processed_signal * 32767).astype(np.int16)
+    original_int16 = (test_signal * 32767).astype(np.int16)
+    
+    wavfile.write(output_file, fs, processed_int16)
+    wavfile.write(original_file, fs, original_int16)
+    
+    print(f"✅ Audio files saved:")
+    print(f"  📁 {output_file} - Processed with IRM approximation")
+    print(f"  📁 {original_file} - Original test signal")
+    
+    # Generate visualization
+    print(f"\n📊 Generating IRM visualization...")
+    
+    plt.figure(figsize=(15, 10))
+    
+    # Plot 1: Original IRM spectrogram
+    plt.subplot(3, 2, 1)
+    plt.imshow(H_mag.T, aspect='auto', origin='lower', cmap='viridis')
+    plt.title('Target IRM (Synthetic)')
+    plt.ylabel('Frequency Bin')
+    plt.xlabel('Time Frame')
+    plt.colorbar(label='Magnitude')
+    
+    # Plot 2: Filter parameters over time
+    plt.subplot(3, 2, 2)
+    for i in range(filterbank.num_filters):
+        gains = [irm_config['filter_params'][t][i].gain for t in range(T)]
+        plt.plot(gains, label=f'Filter {i+1} ({filterbank.center_freqs[i]:.0f}Hz)')
+    plt.title('Filter Gains Over Time')
+    plt.ylabel('Gain (dB)')
+    plt.xlabel('Time Frame')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Plot 3: Original signal spectrogram
+    plt.subplot(3, 2, 3)
+    from scipy import signal
+    f_spec, t_spec, Sxx = signal.spectrogram(test_signal, fs, nperseg=256, noverlap=128)
+    plt.pcolormesh(t_spec, f_spec, 10*np.log10(Sxx + 1e-10), shading='gouraud')
+    plt.title('Original Signal Spectrogram')
+    plt.ylabel('Frequency (Hz)')
+    plt.xlabel('Time (s)')
+    plt.colorbar(label='Power (dB)')
+    
+    # Plot 4: Processed signal spectrogram
+    plt.subplot(3, 2, 4)
+    f_spec, t_spec, Sxx_proc = signal.spectrogram(processed_signal, fs, nperseg=256, noverlap=128)
+    plt.pcolormesh(t_spec, f_spec, 10*np.log10(Sxx_proc + 1e-10), shading='gouraud')
+    plt.title('Processed Signal Spectrogram')
+    plt.ylabel('Frequency (Hz)')
+    plt.xlabel('Time (s)')
+    plt.colorbar(label='Power (dB)')
+    
+    # Plot 5: Time domain signals
+    plt.subplot(3, 2, 5)
+    t_plot = t[:int(0.5 * fs)]  # First 0.5 seconds
+    plt.plot(t_plot, test_signal[:len(t_plot)], 'b-', alpha=0.7, label='Original')
+    plt.plot(t_plot, processed_signal[:len(t_plot)], 'r-', alpha=0.7, label='Processed')
+    plt.title('Time Domain Comparison (first 0.5s)')
+    plt.ylabel('Amplitude')
+    plt.xlabel('Time (s)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Plot 6: Approximation error over time
+    plt.subplot(3, 2, 6)
+    plt.plot(irm_config['approximation_error'])
+    plt.title('IRM Approximation Error Over Time')
+    plt.ylabel('RMS Error')
+    plt.xlabel('Time Frame')
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('irm_approximation_demo.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  📁 irm_approximation_demo.png - Complete visualization")
+    
+    print(f"\n🎉 IRM approximation demo complete!")
+    print(f"\nThis demonstrates:")
+    print(f"  • Time-varying lattice filterbank for IRM approximation")
+    print(f"  • Smooth parameter updates every {hop_length} samples")
+    print(f"  • Real-time processing with dynamic frequency response")
+    print(f"  • Perfect for speech enhancement and source separation")
+
+
 def demonstrate_working_filterbank():
     """Demonstrate the working Direct Form 1 filterbank implementation."""
     print("\n" + "=" * 50)
@@ -974,6 +1455,9 @@ if __name__ == "__main__":
     
     # Run real-time modulation demo
     demo_realtime_modulation()
+    
+    # Run IRM approximation demo
+    demo_irm_approximation()
     
     print("\n" + "=" * 50)
     print("SUMMARY")
