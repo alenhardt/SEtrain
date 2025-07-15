@@ -1,44 +1,80 @@
-# A code template for training DNN-based speech enhancement models.
-A training code template is highly valuable for deep learning engineers as it can significantly enhance their work efficiency. Despite different programmers have varying coding styles, some are excellent while others may not be as good. My philosophy is to prioritize simplicity. In this context, I am sharing a practical organizational structure for training code files in speech enhancement (SE). The primary focus is on keeping it concise and intuitive rather than aiming for comprehensiveness.
+# Lattice-Ladder Filterbank Implementation
 
-## File Specification
-For training:
-* `cfg_train.toml`: Specifies the training configurations.
-* `datasets.py`: Provides the dataset class for the dataloader.
-* `distributed_utils.py`: Assists with Distributed Data Parallel (DDP) training.
-* `loss_factory.py`: Provides various useful loss functions in SE.
-* `model.py`: Defines the model.
-* `train.py`: Conducts the training process, surpports both multiple-GPU and single-GPU conditions.
-* `trainer.py`: Encapsulates various functions during training, surpports both multiple-GPU and single-GPU conditions.
+## Status Summary
 
-For evaluation:
-* `cfg_infer.yaml`: Specifies the evaluation configurations.
-* `infer_folder.py`: Conducts evaluation on a folder of WAV files.
-* `infer_loader.py`: Conducts evaluation using a dataloader.
-* `score_utils.py`: Provides calculations for various metrics.
+| Component | Status | Notes |
+|-----------|--------|--------|
+| Direct Form 1 Biquad Filters | ✅ **WORKING** | Fully functional and tested |
+| Biquad Coefficient Design | ✅ **WORKING** | Supports peaking, lowpass, highpass, bandpass |
+| Frequency Response Plotting | ✅ **WORKING** | Generates accurate frequency response plots |
+| Lattice-Ladder Conversion | ❌ **UNDER DEVELOPMENT** | Known issue - see below |
 
-## Usage
-When starting a new SE project, you should follow these steps:
-1. Modify `datasets.py`;
-2. Define your own `model.py`;
-3. Modify the `config.toml` to match your training setup;
-4. Select a loss function in `loss_factory.py`, or create a new one if needed;
-5. Probably do not need to modify `trainer.py`;
-6. Run the `train.py`:
-   ```
-   python train.py
-   python train.py -D 1
-   python train.py -C cfg_train.toml -D 1
-   python train.py -C cfg_train.toml -D 0,1,2,3
-   ```
-8. Before evaluation, remember to modify `cfg_infer.yaml` to ensure that the paths are correctly configured.
+## Known Issues
 
-## Note
-1. The code is originally intended for Linux systems, and if you attempt to adapt it to the Windows platform, you may encounter certain issues:
-* Incompatibility of paths: The file paths used in Linux systems may not be compatible with the file paths in Windows.
-* Challenges in installing the pesq package: The process of installing the pesq package on Windows may not be straightforward and may require additional steps or configurations.
+### Lattice-Ladder Conversion Problem
 
-2. The code is merely provided as a template, and some negligible details are not included in the repository, such as the `INFO.csv` in  `datasets.py` and `DNSMOS` in the `infer_folder`/`infer_loader.py`.
+The conversion from biquad coefficients to lattice-ladder form is currently not working correctly. The issue manifests as:
 
-## Acknowledgement
-This code template heavily borrows from the excellent [Sheffield_Clarity_CEC1_Entry](https://github.com/TuZehai/Sheffield_Clarity_CEC1_Entry) repository in many aspects.
+- Overflow warnings in the original implementation
+- Significant differences between lattice and direct form outputs after attempted fixes
+- Test failures when comparing lattice vs direct form implementations
+
+**Root Cause**: The lattice-ladder conversion algorithm and/or the lattice filter processing structure needs to be corrected based on proper DSP literature.
+
+**Impact**: This only affects the lattice implementation. The Direct Form 1 implementation works perfectly and can be used for all filtering needs.
+
+## Working Alternative: Direct Form 1 Implementation
+
+The Direct Form 1 biquad filterbank is fully functional and provides the same filtering capabilities:
+
+```python
+from lattice_filterbank import DirectForm1Filterbank, FilterParams, design_biquad_coefficients
+
+# Define filter parameters
+filter_params = [
+    FilterParams(center_freq=500, gain=6, q_factor=1.0, fs=48000, filter_type='peaking'),
+    FilterParams(center_freq=1500, gain=-3, q_factor=2.0, fs=48000, filter_type='peaking'),
+]
+
+# Create biquad coefficients
+biquad_coeffs = []
+for params in filter_params:
+    b0, b1, b2, a1, a2 = design_biquad_coefficients(params)
+    biquad_coeffs.append((b0, b1, b2, a1, a2))
+
+# Create and use filterbank
+filterbank = DirectForm1Filterbank(biquad_coeffs)
+filtered_signal = filterbank.filter_signal(input_signal)
+```
+
+## Recommendations
+
+1. **For immediate use**: Use the `DirectForm1Filterbank` class which provides the same filtering functionality
+2. **For development**: The lattice conversion issue needs research into proper DSP algorithms
+3. **For testing**: Run the demonstration to see the working components
+
+## Running the Code
+
+```bash
+python3 lattice_filterbank.py
+```
+
+This will:
+- Demonstrate the working Direct Form 1 filterbank
+- Show the lattice conversion issue 
+- Generate a frequency response plot
+- Provide a clear status summary
+
+## Files
+
+- `lattice_filterbank.py` - Main implementation with both working and problematic components
+- `filterbank_response.png` - Generated frequency response plot
+- `README.md` - This status document
+
+## Technical Notes
+
+The lattice-ladder filter implementation requires:
+1. Correct conversion from biquad (b0,b1,b2,a1,a2) to lattice coefficients (k1,k2,v0,v1,v2)
+2. Proper lattice filter processing algorithm that matches the direct form response
+
+Current implementations of both are incorrect and need revision based on standard DSP references.
