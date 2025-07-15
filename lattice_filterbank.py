@@ -510,21 +510,24 @@ def plot_frequency_response():
 
 
 def simple_test():
-    """Simple test with a basic low-pass filter to debug the conversion."""
-    print("\nDEBUG: Simple lattice conversion test...")
+    """Simple test with an IIR filter to debug the conversion."""
+    print("\nDEBUG: Lattice conversion test for IIR filter...")
     
-    # Test with simple IIR coefficients (low-pass with feedback)
-    b0, b1, b2 = 0.1, 0.2, 0.1  # Numerator  
-    a1, a2 = -0.5, 0.2  # Denominator (with feedback)
+    # Test with proper IIR filter coefficients from biquad design
+    # Use a low-pass filter with Q=0.707 (Butterworth) at 1kHz, fs=48kHz
+    fs = 48000
+    filter_params = FilterParams(center_freq=1000, gain=0, q_factor=0.707, fs=fs, filter_type='lowpass')
     
-    print(f"Input biquad: b=[{b0}, {b1}, {b2}], a=[1, {a1}, {a2}]")
+    # Get the biquad coefficients
+    b0, b1, b2, a1, a2 = design_biquad_coefficients(filter_params)
+    print(f"IIR Biquad coeffs: b=[{b0:.6f}, {b1:.6f}, {b2:.6f}], a=[1, {a1:.6f}, {a2:.6f}]")
     
     # Convert to lattice
     k1, k2, v0, v1, v2 = biquad_to_lattice(b0, b1, b2, a1, a2)
     print(f"Lattice coeffs: k1={k1:.6f}, k2={k2:.6f}, v0={v0:.6f}, v1={v1:.6f}, v2={v2:.6f}")
     
     # Test with a simple impulse
-    test_signal = np.array([1.0, 0.0, 0.0, 0.0, 0.0])
+    test_signal = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     
     # Direct form response
     df1_filter = DirectForm1Biquad(b0, b1, b2, a1, a2)
@@ -542,6 +545,15 @@ def simple_test():
     print(f"DF1:     {np.array(df1_output)}")
     print(f"Lattice: {np.array(lattice_output)}")
     print(f"Diff:    {np.array(lattice_output) - np.array(df1_output)}")
+    
+    # Check if the responses are similar
+    max_diff = np.max(np.abs(np.array(lattice_output) - np.array(df1_output)))
+    if max_diff < 1e-10:
+        print(f"✅ Lattice conversion working! Max difference: {max_diff:.2e}")
+    else:
+        print(f"❌ Lattice conversion issue. Max difference: {max_diff:.2e}")
+        print("NOTE: Lattice structures are most beneficial for real-time parameter modulation")
+        print("where coefficient updates in biquads can cause glitches.")
 
 
 def demonstrate_working_filterbank():
@@ -595,15 +607,28 @@ if __name__ == "__main__":
     print("Lattice-Ladder Filterbank Implementation")
     print("=" * 50)
     
-    # NOTE: The lattice-ladder conversion is a work in progress
-    # The Direct Form implementation is working correctly
-    print("\n⚠️  NOTE: Lattice-ladder conversion is currently under development.")
-    print("The Direct Form 1 implementation works correctly and can be used.")
+    # Enhanced explanation of lattice structures
+    print("\n📚 ABOUT LATTICE STRUCTURES:")
+    print("Lattice-ladder structures are particularly valuable for:")
+    print("  • Real-time parameter modulation (frequency, Q, gain)")
+    print("  • Avoiding transients/glitches when updating coefficients")
+    print("  • Improved numerical stability")
+    print("  • Coefficient sensitivity reduction")
+    print("\nAs noted by Robert Bristow-Johnson (RBJ):")
+    print("'If you want to vary parameters continuously while passing signal,")
+    print("you are not supposed to use biquads (because updating coefficients")
+    print("causes glitches) and you should use state-variable filters instead.'")
+    print("\nLattice structures provide an alternative approach for smooth parameter updates.")
+    
+    print("\n⚠️  CURRENT STATUS:")
+    print("• Direct Form 1 biquad implementation: ✅ WORKING")
+    print("• Lattice-ladder conversion algorithm: 🔧 UNDER DEVELOPMENT")
+    print("• Use Direct Form 1 for immediate applications")
     
     # Demonstrate the working parts first
     demonstrate_working_filterbank()
     
-    # Run simple debug test 
+    # Run simple debug test with proper IIR filter
     simple_test()
     
     # Run main tests (these will currently fail due to lattice conversion issues)
@@ -630,4 +655,8 @@ if __name__ == "__main__":
     print("✅ Biquad coefficient calculation: WORKING") 
     print("❌ Lattice-ladder conversion: UNDER DEVELOPMENT")
     print("✅ Frequency response calculation: WORKING")
+    print("\n📖 NEXT STEPS:")
+    print("• Research RBJ's specific lattice coefficient update method")
+    print("• Implement proper biquad-to-lattice conversion algorithm")
+    print("• Add real-time parameter modulation capabilities")
     print("=" * 50)
