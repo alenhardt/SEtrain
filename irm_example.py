@@ -36,9 +36,9 @@ def load_audio_files(noisy_file, clean_file):
     """Load and align two audio files."""
     print(f"📁 Loading audio files...")
     
-    # Load audio files
-    noisy_audio, sr_noisy = librosa.load(noisy_file, sr=None)
-    clean_audio, sr_clean = librosa.load(clean_file, sr=None)
+    # Load audio files - force 16kHz for consistency
+    noisy_audio, sr_noisy = librosa.load(noisy_file, sr=16000)
+    clean_audio, sr_clean = librosa.load(clean_file, sr=16000)
     
     print(f"   Noisy: {noisy_file} - {len(noisy_audio)} samples, {sr_noisy} Hz")
     print(f"   Clean: {clean_file} - {len(clean_audio)} samples, {sr_clean} Hz")

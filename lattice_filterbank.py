@@ -872,9 +872,9 @@ def demo_realtime_modulation():
     print("structure enables smooth, glitch-free real-time modulation!")
 
 
-def approximate_irm_with_lattice_filterbank(H_mag: np.ndarray, fs: int = 48000, nfft: int = 256, 
+def approximate_irm_with_lattice_filterbank(H_mag: np.ndarray, fs: int = 16000, nfft: int = 256, 
                                           num_filters: int = 8, filter_type: str = 'peaking',
-                                          freq_range: tuple = (100, 16000), 
+                                          freq_range: tuple = (100, 7000), 
                                           max_gain_db: float = 20.0) -> dict:
     """
     Approximate an Ideal Ratio Mask using a time-varying lattice filterbank.
