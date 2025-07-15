@@ -3,6 +3,8 @@ import scipy.signal as signal
 from typing import List, Tuple, Union
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
+import scipy.io.wavfile as wavfile
+import os
 
 
 @dataclass
@@ -636,6 +638,240 @@ class RBJLatticeFilter:
         return y
 
 
+def demo_realtime_modulation():
+    """
+    Demonstrate real-time parameter modulation with RBJ's lattice filters.
+    
+    This demo:
+    1. Creates or loads a test audio signal
+    2. Processes it with a 2-filter lattice filterbank
+    3. Modulates filter center frequencies every 4ms
+    4. Saves the processed audio to demonstrate smooth parameter changes
+    """
+    print("\n" + "=" * 50)
+    print("🎵 REAL-TIME PARAMETER MODULATION DEMO")
+    print("=" * 50)
+    
+    # Audio parameters
+    fs = 48000  # Sample rate
+    duration = 4.0  # Duration in seconds
+    modulation_interval_ms = 4  # Modulate every 4ms
+    samples_per_modulation = int(fs * modulation_interval_ms / 1000)  # 192 samples at 48kHz
+    
+    print(f"Sample rate: {fs} Hz")
+    print(f"Duration: {duration} seconds")
+    print(f"Modulation interval: {modulation_interval_ms} ms ({samples_per_modulation} samples)")
+    
+    # Create test signal (or try to load existing WAV file)
+    input_file = "input_test.wav"
+    
+    if os.path.exists(input_file):
+        print(f"\n📁 Loading audio file: {input_file}")
+        try:
+            sample_rate, audio_data = wavfile.read(input_file)
+            if sample_rate != fs:
+                print(f"⚠️  Warning: File sample rate {sample_rate} Hz, resampling to {fs} Hz")
+                # Simple resampling (for demo purposes)
+                audio_data = audio_data[::int(sample_rate/fs)] if sample_rate > fs else audio_data
+            
+            # Convert to mono if stereo
+            if len(audio_data.shape) > 1:
+                audio_data = np.mean(audio_data, axis=1)
+                
+            # Normalize to [-1, 1]
+            audio_data = audio_data.astype(np.float32) / np.max(np.abs(audio_data))
+            
+            # Trim or pad to desired duration
+            target_length = int(fs * duration)
+            if len(audio_data) > target_length:
+                audio_data = audio_data[:target_length]
+            else:
+                # Pad with zeros if too short
+                audio_data = np.pad(audio_data, (0, target_length - len(audio_data)))
+                
+        except Exception as e:
+            print(f"❌ Error loading {input_file}: {e}")
+            print("🎹 Creating test signal instead...")
+            audio_data = None
+    else:
+        audio_data = None
+    
+    # Create test signal if no file loaded
+    if audio_data is None:
+        print("🎹 Creating test signal (sine wave sweep + white noise)")
+        t = np.linspace(0, duration, int(fs * duration), endpoint=False)
+        
+        # Create a frequency sweep from 100Hz to 4000Hz
+        f_start, f_end = 100, 4000
+        freq_sweep = f_start + (f_end - f_start) * t / duration
+        audio_data = 0.5 * np.sin(2 * np.pi * freq_sweep * t)
+        
+        # Add some white noise for texture
+        audio_data += 0.1 * np.random.randn(len(t))
+        
+        # Add some harmonics
+        audio_data += 0.2 * np.sin(2 * np.pi * freq_sweep * 2 * t)  # 2nd harmonic
+        audio_data += 0.1 * np.sin(2 * np.pi * freq_sweep * 3 * t)  # 3rd harmonic
+        
+        # Normalize
+        audio_data = audio_data / np.max(np.abs(audio_data)) * 0.8
+    
+    print(f"✅ Audio signal ready: {len(audio_data)} samples, {len(audio_data)/fs:.2f} seconds")
+    
+    # Initialize 2-filter lattice filterbank
+    print("\n🔧 Setting up 2-filter lattice filterbank...")
+    
+    # Filter 1: Low-mid peaking filter (will modulate 200Hz - 2000Hz)
+    # Filter 2: High-mid peaking filter (will modulate 1000Hz - 8000Hz)
+    
+    # Initial filter parameters
+    filter1_freq_range = (200, 2000)    # Hz
+    filter2_freq_range = (1000, 8000)   # Hz
+    filter_gain = 6.0  # dB boost
+    filter_q = 2.0
+    
+    # Create modulation patterns (sinusoidal)
+    num_updates = int(duration * 1000 / modulation_interval_ms)
+    modulation_times = np.linspace(0, duration, num_updates)
+    
+    # Filter 1 modulation: slow sine wave
+    filter1_freqs = filter1_freq_range[0] + (filter1_freq_range[1] - filter1_freq_range[0]) * \
+                    (0.5 + 0.5 * np.sin(2 * np.pi * 0.5 * modulation_times))  # 0.5 Hz modulation
+    
+    # Filter 2 modulation: faster sine wave
+    filter2_freqs = filter2_freq_range[0] + (filter2_freq_range[1] - filter2_freq_range[0]) * \
+                    (0.5 + 0.5 * np.sin(2 * np.pi * 1.2 * modulation_times))  # 1.2 Hz modulation
+    
+    print(f"Filter 1 modulation: {filter1_freq_range[0]}-{filter1_freq_range[1]} Hz at 0.5 Hz rate")
+    print(f"Filter 2 modulation: {filter2_freq_range[0]}-{filter2_freq_range[1]} Hz at 1.2 Hz rate")
+    
+    # Process audio with real-time parameter modulation
+    print("\n🎵 Processing audio with real-time parameter modulation...")
+    
+    processed_audio = np.zeros_like(audio_data)
+    
+    # Initialize filters
+    filter1_lattice = None
+    filter2_lattice = None
+    
+    update_count = 0
+    
+    for i in range(len(audio_data)):
+        # Check if it's time to update filter parameters
+        if i % samples_per_modulation == 0 and update_count < len(filter1_freqs):
+            # Get new frequencies for this update period
+            f1 = filter1_freqs[update_count]
+            f2 = filter2_freqs[update_count]
+            
+            # Design new biquad coefficients
+            filter1_params = FilterParams(
+                center_freq=f1, gain=filter_gain, q_factor=filter_q, 
+                fs=fs, filter_type='peaking'
+            )
+            filter2_params = FilterParams(
+                center_freq=f2, gain=filter_gain, q_factor=filter_q, 
+                fs=fs, filter_type='peaking'
+            )
+            
+            # Convert to lattice coefficients using RBJ's method
+            b0_1, b1_1, b2_1, a1_1, a2_1 = design_biquad_coefficients(filter1_params)
+            k1_1, k2_1, v0_1, v1_1, v2_1 = biquad_to_lattice(b0_1, b1_1, b2_1, a1_1, a2_1)
+            
+            b0_2, b1_2, b2_2, a1_2, a2_2 = design_biquad_coefficients(filter2_params)
+            k1_2, k2_2, v0_2, v1_2, v2_2 = biquad_to_lattice(b0_2, b1_2, b2_2, a1_2, a2_2)
+            
+            # Create new lattice filters with updated coefficients
+            # The beauty of lattice filters: we can update coefficients without glitches!
+            if filter1_lattice is None:
+                filter1_lattice = RBJLatticeFilter(k1_1, k2_1, v0_1, v1_1, v2_1)
+                filter2_lattice = RBJLatticeFilter(k1_2, k2_2, v0_2, v1_2, v2_2)
+            else:
+                # Smooth coefficient update (the key advantage of lattice filters!)
+                filter1_lattice.k1, filter1_lattice.k2 = k1_1, k2_1
+                filter1_lattice.v0, filter1_lattice.v1, filter1_lattice.v2 = v0_1, v1_1, v2_1
+                
+                filter2_lattice.k1, filter2_lattice.k2 = k1_2, k2_2
+                filter2_lattice.v0, filter2_lattice.v1, filter2_lattice.v2 = v0_2, v1_2, v2_2
+            
+            if update_count % 50 == 0:  # Print progress every 200ms
+                print(f"  {update_count*modulation_interval_ms:4d}ms: F1={f1:4.0f}Hz, F2={f2:4.0f}Hz")
+            
+            update_count += 1
+        
+        # Process sample through both filters
+        x = audio_data[i]
+        
+        # Filter 1
+        y1 = filter1_lattice.process_sample(x) if filter1_lattice else x
+        
+        # Filter 2 (cascaded)
+        y2 = filter2_lattice.process_sample(y1) if filter2_lattice else y1
+        
+        processed_audio[i] = y2
+    
+    print(f"✅ Processing complete! Updated filter parameters {update_count} times")
+    
+    # Save processed audio
+    output_file = "realtime_modulation_demo.wav"
+    print(f"\n💾 Saving processed audio to: {output_file}")
+    
+    # Convert to 16-bit integer and save
+    processed_audio_int16 = (processed_audio * 32767).astype(np.int16)
+    original_audio_int16 = (audio_data * 32767).astype(np.int16)
+    
+    wavfile.write(output_file, fs, processed_audio_int16)
+    wavfile.write("original_test_signal.wav", fs, original_audio_int16)
+    
+    print(f"✅ Files saved:")
+    print(f"  📁 {output_file} - Processed with real-time modulation")
+    print(f"  📁 original_test_signal.wav - Original signal for comparison")
+    
+    # Generate modulation visualization
+    print(f"\n📊 Generating modulation visualization...")
+    
+    plt.figure(figsize=(12, 8))
+    
+    # Plot 1: Frequency modulation over time
+    plt.subplot(3, 1, 1)
+    plt.plot(modulation_times[:len(filter1_freqs)], filter1_freqs, 'b-', label='Filter 1', linewidth=2)
+    plt.plot(modulation_times[:len(filter2_freqs)], filter2_freqs, 'r-', label='Filter 2', linewidth=2)
+    plt.ylabel('Frequency (Hz)')
+    plt.title('Real-Time Filter Parameter Modulation')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Plot 2: Original signal waveform (first 0.1 seconds)
+    plt.subplot(3, 1, 2)
+    t_plot = np.linspace(0, 0.1, int(0.1 * fs))
+    plt.plot(t_plot, audio_data[:len(t_plot)], 'k-', alpha=0.7)
+    plt.ylabel('Amplitude')
+    plt.title('Original Signal (first 100ms)')
+    plt.grid(True, alpha=0.3)
+    
+    # Plot 3: Processed signal waveform (first 0.1 seconds)
+    plt.subplot(3, 1, 3)
+    plt.plot(t_plot, processed_audio[:len(t_plot)], 'g-', alpha=0.7)
+    plt.ylabel('Amplitude')
+    plt.xlabel('Time (seconds)')
+    plt.title('Processed Signal with Real-Time Modulation (first 100ms)')
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('realtime_modulation_demo.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  📁 realtime_modulation_demo.png - Visualization saved")
+    
+    print("\n🎉 Real-time modulation demo complete!")
+    print("\nThis demonstrates the key advantage of RBJ's lattice filters:")
+    print("  • Smooth parameter updates without audible glitches")
+    print("  • Real-time frequency modulation at 250 Hz update rate")
+    print("  • Stable performance with continuously changing parameters")
+    print("\nWith direct biquad coefficient updates, you would hear")
+    print("audible clicks and pops at each parameter change. The lattice")
+    print("structure enables smooth, glitch-free real-time modulation!")
+
+
 def demonstrate_working_filterbank():
     """Demonstrate the working Direct Form 1 filterbank implementation."""
     print("\n" + "=" * 50)
@@ -735,6 +971,9 @@ if __name__ == "__main__":
     
     # Demonstrate working filterbank
     demonstrate_working_filterbank()
+    
+    # Run real-time modulation demo
+    demo_realtime_modulation()
     
     print("\n" + "=" * 50)
     print("SUMMARY")
