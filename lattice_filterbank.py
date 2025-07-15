@@ -194,73 +194,32 @@ def design_biquad_coefficients(params: FilterParams) -> Tuple[float, float, floa
 
 def biquad_to_lattice(b0: float, b1: float, b2: float, a1: float, a2: float) -> Tuple[float, float, float, float, float]:
     """
-    Convert biquad coefficients to lattice-ladder form using the correct step-down recursion.
+    Convert biquad coefficients to lattice-ladder form using RBJ's direct method.
     
-    Based on the standard Schur-Cohn/Levinson-Durbin step-down procedure
-    from "Introduction to Digital Filters" by Julius O. Smith III.
+    Based on Robert Bristow-Johnson's derivation for real-time modulated IIR filters.
+    Reference: https://dsp.stackexchange.com/questions/48255/real-time-modulated-iir-filter
     
     Args:
         b0, b1, b2: Numerator coefficients  
-        a1, a2: Denominator coefficients (a0 is assumed to be 1)
+        a1, a2: Denominator coefficients (a0 is assumed to be 1, normalized)
         
     Returns:
         Tuple of (k1, k2, v0, v1, v2) lattice-ladder coefficients
     """
     
-    # Step 1: Convert denominator polynomial to reflection coefficients
-    # Given polynomial: A(z) = 1 + a1*z^-1 + a2*z^-2
-    # Use the step-down recursion: A_{N-1}(z) = (A_N(z) - k_N * A_N_flip(z)) / (1 - k_N^2)
+    # RBJ's direct conversion formulas for biquad to lattice-ladder:
+    # (assumes biquad coefficients are normalized by a0)
     
-    # Initialize polynomial coefficients A2(z) = [1, a1, a2]
-    A2 = [1.0, a1, a2]
+    # Reflection coefficients (all-pole lattice section)
+    k2 = a2
+    k1 = a1 / (a2 + 1)
     
-    # Step 1: k2 = a2 (last coefficient)
-    k2 = A2[2]
-    
-    # Ensure stability: |k2| < 1
-    if abs(k2) >= 1.0:
-        k2 = np.sign(k2) * 0.999
-    
-    # Step 2: Compute A1(z) using step-down recursion
-    # A1(z) = (A2(z) - k2 * A2_flip(z)) / (1 - k2^2)
-    # A2_flip(z) = [a2, a1, 1] (reverse of A2)
-    A2_flip = [A2[2], A2[1], A2[0]]  # [a2, a1, 1]
-    
-    denom = 1.0 - k2 * k2
-    if abs(denom) < 1e-15:
-        # Avoid division by zero - filter is at stability boundary
-        k1 = 0.0
-    else:
-        # A1[0] = (A2[0] - k2 * A2_flip[0]) / denom = (1 - k2 * a2) / denom
-        A1_0 = (A2[0] - k2 * A2_flip[0]) / denom
-        # A1[1] = (A2[1] - k2 * A2_flip[1]) / denom = (a1 - k2 * a1) / denom  
-        A1_1 = (A2[1] - k2 * A2_flip[1]) / denom
-        
-        # For the reduced polynomial A1(z) = A1_0 + A1_1*z^-1
-        # We should have A1_0 = 1 (normalized), so k1 = A1_1
-        k1 = A1_1
-    
-    # Ensure stability: |k1| < 1
-    if abs(k1) >= 1.0:
-        k1 = np.sign(k1) * 0.999
-    
-    # Step 2: Convert numerator coefficients to ladder taps
-    # The ladder coefficients correspond to tapping the intermediate
-    # signals in the lattice structure at different stages
-    
-    # For a proper lattice-ladder implementation, the ladder coefficients
-    # need to be computed to match the desired numerator transfer function
-    # This is a more complex operation that involves solving for the 
-    # feedforward gains that produce the desired zeros
-    
-    # For now, use the direct assignment (this is the simplest approach)
-    # The complete transformation would require solving:
-    # B(z) = v0*E0(z) + v1*E1(z) + v2*E2(z) = b0 + b1*z^-1 + b2*z^-2
-    # where E0, E1, E2 are the intermediate signals in the lattice
-    
-    v0 = b0
-    v1 = b1
+    # Ladder coefficients (feedforward section) 
     v2 = b2
+    v1 = b1 - a1 * b2
+    
+    # Try interpretation 2: v0 = b0 - (a1 / (a2 + 1))*b1 + a1^2 / (a2 + 1) - a2 * b2
+    v0 = b0 - (a1 / (a2 + 1)) * b1 + a1*a1 / (a2 + 1) - a2 * b2
     
     return k1, k2, v0, v1, v2
 
